@@ -48,3 +48,15 @@ class EnTokenizer:
         txt = txt.replace(EOT, '')
         txt = txt.replace(UNK, '')
         return txt
+
+
+class MTLTokenizer(EnTokenizer):
+    """Multilingual tokenizer that handles language_id prefix"""
+
+    def text_to_tokens(self, text: str, language_id: str = None):
+        """Convert text to tokens with optional language prefix"""
+        if language_id:
+            text = f"[{language_id}] {text}"
+        text_tokens = self.encode(text)
+        text_tokens = torch.IntTensor(text_tokens).unsqueeze(0)
+        return text_tokens
