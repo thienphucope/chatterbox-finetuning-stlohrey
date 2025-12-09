@@ -133,7 +133,7 @@ class SpeechFineTuningDataset(Dataset):
             item = self.dataset_source[idx]
             text = item[self.data_args.text_column_name]
             audio_data = item[self.data_args.audio_column_name]
-            
+
             if isinstance(audio_data, str):
                  wav_array, original_sr = librosa.load(audio_data, sr=None, mono=True)
             elif isinstance(audio_data, dict) and "array" in audio_data and "sampling_rate" in audio_data:
@@ -151,7 +151,7 @@ class SpeechFineTuningDataset(Dataset):
                 wav_16k = librosa.resample(wav_array, orig_sr=original_sr, target_sr=self.s3_sr)
             else:
                 wav_16k = wav_array.copy()
-            
+
             if wav_16k.ndim > 1: wav_16k = librosa.to_mono(wav_16k)
             if wav_16k.dtype != np.float32:
                 wav_16k = wav_16k.astype(np.float32)
@@ -200,7 +200,7 @@ class SpeechFineTuningDataset(Dataset):
         except Exception as e:
             logger.error(f"Error getting speech tokens for item {idx}: {e}. Skipping.")
             return None
-            
+
         speech_tokens = F.pad(raw_speech_tokens, (1, 0), value=self.chatterbox_t3_config.start_speech_token)
         speech_tokens = F.pad(speech_tokens, (0, 1), value=self.chatterbox_t3_config.stop_speech_token)
         if len(speech_tokens) > self.data_args.max_speech_len:
@@ -228,7 +228,7 @@ class SpeechFineTuningDataset(Dataset):
             target_len = self.chatterbox_t3_config.speech_cond_prompt_len
             if current_len > target_len: cond_prompt_speech_tokens = cond_prompt_speech_tokens[:target_len]
             else: cond_prompt_speech_tokens = F.pad(cond_prompt_speech_tokens, (0, target_len - current_len), value=0)
-        
+
         emotion_adv_scalar=0.5
         emotion_adv_scalar_tensor = torch.tensor(emotion_adv_scalar, dtype=torch.float)
 
@@ -324,9 +324,9 @@ class SpeechDataCollator:
         labels_speech[mask_speech_total] = IGNORE_ID    # set prompt & pad to -100
 
         return {
-            "text_tokens": padded_text_tokens, 
+            "text_tokens": padded_text_tokens,
             "text_token_lens": text_token_lens,
-            "speech_tokens": padded_speech_tokens, 
+            "speech_tokens": padded_speech_tokens,
             "speech_token_lens": speech_token_lens,
             "t3_cond_speaker_emb": t3_cond_speaker_emb,
             "t3_cond_prompt_speech_tokens": t3_cond_prompt_speech_tokens,
@@ -386,7 +386,7 @@ class T3ForFineTuning(torch.nn.Module):
                                 labels_text =labels_text,
                                 labels_speech=labels_speech
                                 )
-        
+
         total_loss = loss_text + loss_speech
 
         return total_loss, speech_logits
@@ -414,6 +414,22 @@ def main():
     logger.info("Model parameters %s", model_args)
     logger.info("Data parameters %s", data_args)
     set_seed(training_args.seed)
+
+    # ==============================================================================
+    # --- FIX 2: HACK CẤU HÌNH (QUAN TRỌNG NHẤT) ---
+    # Ép model khởi tạo với size 2549 thay vì 704
+    # ==============================================================================
+    if model_args.local_model_dir:
+        logger.info("!!! DETECTED LOCAL MODEL - APPLYING VOCAB SIZE PATCH !!!")
+        # Số 2549 lấy từ lỗi mismatch của bạn.
+        # Nếu sau này bạn thay đổi bộ từ điển, hãy sửa số này theo lỗi báo.
+        NEW_VOCAB_SIZE = 2549
+
+        # Can thiệp trực tiếp vào giá trị mặc định của class T3Config
+        # Để khi ChatterboxTTS.from_local gọi T3(), nó sẽ dùng số này.
+        T3Config.text_tokens_dict_size = NEW_VOCAB_SIZE
+        logger.info(f"Forced T3Config.text_tokens_dict_size to {NEW_VOCAB_SIZE}")
+    # ==============================================================================
 
     logger.info("Loading ChatterboxTTS model...")
 
@@ -460,7 +476,7 @@ def main():
     verification_mode = VerificationMode.NO_CHECKS if data_args.ignore_verifications else VerificationMode.BASIC_CHECKS
 
     train_hf_dataset: Union[datasets.Dataset, List[Dict[str,str]]]
-    eval_hf_dataset: Optional[Union[datasets.Dataset, List[Dict[str,str]]]] = None 
+    eval_hf_dataset: Optional[Union[datasets.Dataset, List[Dict[str,str]]]] = None
 
     if data_args.dataset_name:
         logger.info(f"Loading dataset '{data_args.dataset_name}' from Hugging Face Hub.")
@@ -474,7 +490,7 @@ def main():
         if data_args.train_split_name not in raw_datasets_loaded:
             raise ValueError(f"Train split '{data_args.train_split_name}' not found. Available: {list(raw_datasets_loaded.keys())}")
         train_hf_dataset = raw_datasets_loaded[data_args.train_split_name]
-        
+
         if training_args.do_eval:
             if data_args.eval_split_name and data_args.eval_split_name in raw_datasets_loaded:
                 eval_hf_dataset = raw_datasets_loaded[data_args.eval_split_name]
@@ -494,16 +510,26 @@ def main():
             dataset_root = metadata_path.parent
             with open(metadata_path, 'r', encoding='utf-8') as f:
                 for line_idx, line in enumerate(f):
+                    # --- BẮT ĐẦU ĐOẠN CODE SỬA ---
                     parts = line.strip().split('|')
-                    if len(parts) != 2: parts = line.strip().split('\t')
-                    if len(parts) == 2:
-                        audio_file, text = parts
+                    # Nếu split bằng | mà ra ít hơn 2 cột, thử split bằng Tab
+                    if len(parts) < 2:
+                        parts = line.strip().split('\t')
+
+                    # Sửa điều kiện thành >= 2 (Chấp nhận 2 cột trở lên)
+                    if len(parts) >= 2:
+                        audio_file = parts[0].strip()
+                        text = parts[1].strip()
+                        # Các cột sau (như Speaker) sẽ bị bỏ qua, không gây lỗi nữa
+
                         audio_path = Path(audio_file) if Path(audio_file).is_absolute() else dataset_root / audio_file
                         if audio_path.exists():
                             all_files.append({"audio": str(audio_path), "text": text})
                         else:
                             logger.warning(f"Audio file not found: {audio_path} (line {line_idx+1}). Skipping.")
-                    else: logger.warning(f"Skipping malformed line in metadata (line {line_idx+1}): {line.strip()}")
+                    else:
+                        logger.warning(f"Skipping malformed line in metadata (line {line_idx+1}): {line.strip()}")
+                    # --- KẾT THÚC ĐOẠN CODE SỬA ---
         elif data_args.dataset_dir:
             dataset_path = Path(data_args.dataset_dir)
             for audio_file_path in dataset_path.rglob("*.wav"):
@@ -538,13 +564,13 @@ def main():
                                                 is_hf_format_eval
                                                 )
 
-    data_collator = SpeechDataCollator(chatterbox_t3_config_instance, 
+    data_collator = SpeechDataCollator(chatterbox_t3_config_instance,
                                        chatterbox_t3_config_instance.stop_text_token,
                                        chatterbox_t3_config_instance.stop_speech_token)
 
     hf_trainable_model = T3ForFineTuning(t3_model, chatterbox_t3_config_instance)
 
-    
+
     callbacks = []
     if training_args.early_stopping_patience is not None and training_args.early_stopping_patience > 0:
         callbacks.append(EarlyStoppingCallback(early_stopping_patience=training_args.early_stopping_patience))
@@ -552,24 +578,24 @@ def main():
     trainer_instance = Trainer(
         model=hf_trainable_model,
         args=training_args,
-        train_dataset=train_dataset, 
+        train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
         callbacks=callbacks if callbacks else None
     )
 
-    if training_args.label_names is None: trainer_instance.label_names = ["lables"]
+    if training_args.label_names is None: trainer_instance.label_names = ["labels_text", "labels_speech"]
 
 
     if training_args.do_train:
         logger.info("*** Training T3 model ***")
         train_result = trainer_instance.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
         trainer_instance.save_model()
-        
+
         logger.info("Saving finetuned T3 model weights for ChatterboxTTS...")
         t3_to_save = trainer_instance.model.t3 if hasattr(trainer_instance.model, 't3') else trainer_instance.model.module.t3
         finetuned_t3_state_dict = t3_to_save.state_dict()
-        
+
         output_t3_safetensor_path = Path(training_args.output_dir) / "t3_cfg.safetensors"
         from safetensors.torch import save_file
         save_file(finetuned_t3_state_dict, output_t3_safetensor_path)
